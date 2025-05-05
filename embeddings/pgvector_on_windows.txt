@@ -1,0 +1,7 @@
+Open VS native tools terminal windows, then use nmake to build:
+
+set "PGROOT=C:\devtools\psql"
+git clone --branch v0.5.0 https://github.com/pgvector/pgvector.git
+cd pgvector
+nmake /F Makefile.win
+nmake /F Makefile.win install
