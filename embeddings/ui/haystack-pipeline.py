@@ -25,6 +25,15 @@ azureEndpoint = os.environ["AZURE_OPENAI_ENDPOINT"]
 azureDeployment = os.environ["AZURE_OPENAI_DEPLOYMENT_NAME"]
 azureApiVersion = os.environ.get("AZURE_OPENAI_API_VERSION", "2023-07-01-preview")
 
+# -------------------- Predefined Prompts --------------------
+
+predefinedPrompts = {
+    "summary": "Summarize the key points in this document.",
+    "legal_risks": "What are the legal risks mentioned in the document?",
+    "financial_terms": "List all financial terms defined in this PDF.",
+    "custom": ""  # freeform user prompt
+}
+
 # -------------------- Haystack Setup --------------------
 
 documentStore = SQLDocumentStore(
@@ -50,7 +59,7 @@ reader = OpenAIAnswerGenerator(
 
 pipeline = GenerativeQAPipeline(retriever=retriever, generator=reader)
 
-# -------------------- Global Session Storage --------------------
+# -------------------- Session State --------------------
 
 sessionData = {
     "pdfPath": None,
@@ -59,7 +68,7 @@ sessionData = {
     "pdfName": None,
 }
 
-# -------------------- PDF Utilities --------------------
+# -------------------- PDF Chunking --------------------
 
 def pdfToChunks(pdfPath, chunkSize=5):
     documents = []
@@ -77,11 +86,13 @@ def pdfToChunks(pdfPath, chunkSize=5):
                 })
     return documents
 
-def highlightContextsInPdf(originalPath, contexts, outputPath):
+# -------------------- Highlighting in PyMuPDF --------------------
+
+def highlightContextsInPdf(originalPath, answers, outputPath):
     doc = fitz.open(originalPath)
     foundAny = False
 
-    for answer in contexts:
+    for answer in answers:
         context = answer.context.strip()
         pageNum = answer.meta.get("page")
         if not context or not isinstance(pageNum, int):
@@ -102,6 +113,8 @@ def highlightContextsInPdf(originalPath, contexts, outputPath):
 # -------------------- Handlers --------------------
 
 def uploadPdf(pdfFile):
+    if pdfFile is None:
+        return "⚠️ Please upload a valid PDF file."
     with NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
         tmp.write(pdfFile.read())
         sessionData["pdfPath"] = tmp.name
@@ -110,28 +123,31 @@ def uploadPdf(pdfFile):
 
     # Chunk and index
     documents = pdfToChunks(sessionData["pdfPath"])
+    if not documents:
+        return "⚠️ No readable text found in the PDF."
     documentStore.delete_documents()
     documentStore.write_documents(documents)
     sessionData["pdfIndexed"] = True
 
     return f"✅ PDF uploaded and indexed: `{sessionData['pdfName']}`"
 
-def askQuestion(question):
+def askQuestion(promptText):
     if not sessionData["pdfIndexed"]:
         return "⚠️ Please upload and index a PDF first.", None, None
 
-    result = pipeline.run(query=question, params={"Retriever": {"top_k": 5}})
+    if not promptText or not promptText.strip():
+        return "⚠️ Please enter a prompt/question.", None, None
+
+    result = pipeline.run(query=promptText, params={"Retriever": {"top_k": 5}})
     answers = result.get("answers", [])
 
     if not answers:
         return "No answers found.", None, None
 
-    # Highlight on existing (or previous) PDF version
     newHighlightedPath = "highlighted_output.pdf"
     highlightContextsInPdf(sessionData["highlightedPath"], answers, newHighlightedPath)
     sessionData["highlightedPath"] = newHighlightedPath
 
-    # Format results
     resultText = ""
     for i, ans in enumerate(answers, 1):
         page = ans.meta.get("page", "unknown")
@@ -145,11 +161,13 @@ def askQuestion(question):
 
     return resultText, sessionData["highlightedPath"], "Download highlighted PDF"
 
-# -------------------- Gradio UI --------------------
+def updatePromptText(promptId):
+    return predefinedPrompts.get(promptId, "")
 
-with gr.Blocks(title="PDF Multi-Question QA") as demo:
+# -------------------- Gradio Interface --------------------
+
+with gr.Blocks(title="PDF Multi-Question QA with Prompts") as demo:
     gr.Markdown("## 📄 Ask Multiple Questions about a Single PDF Document")
-
     with gr.Row():
         with gr.Column():
             pdfInput = gr.File(label="Upload PDF", type="binary")
@@ -157,11 +175,17 @@ with gr.Blocks(title="PDF Multi-Question QA") as demo:
             uploadStatus = gr.Markdown()
 
         with gr.Column():
-            questionBox = gr.Textbox(label="Ask a Question")
+            promptIdDropdown = gr.Dropdown(
+                label="Select Prompt",
+                choices=list(predefinedPrompts.keys()),
+                value="custom"
+            )
+            questionBox = gr.Textbox(label="Prompt Text (editable)")
             askBtn = gr.Button("Ask")
             answerBox = gr.Markdown()
             highlightedOutput = gr.File(label="Highlighted PDF", visible=True)
 
+    promptIdDropdown.change(fn=updatePromptText, inputs=promptIdDropdown, outputs=questionBox)
     uploadBtn.click(fn=uploadPdf, inputs=[pdfInput], outputs=[uploadStatus])
     askBtn.click(fn=askQuestion, inputs=[questionBox], outputs=[answerBox, highlightedOutput, gr.Label(visible=False)])
 
