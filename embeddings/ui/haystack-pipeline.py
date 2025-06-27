@@ -1,11 +1,10 @@
-# requirements:
-# pip install gradio farm-haystack[postgres] pymupdf nltk psycopg2-binary
-
 import os
-import fitz  # PyMuPDF
 import nltk
+import fitz  # PyMuPDF
 import gradio as gr
+import pdfplumber
 from nltk import sent_tokenize
+from tempfile import NamedTemporaryFile
 
 from haystack.document_stores import SQLDocumentStore
 from haystack.nodes import BM25Retriever, OpenAIAnswerGenerator
@@ -13,133 +12,158 @@ from haystack.pipelines import GenerativeQAPipeline
 
 nltk.download("punkt")
 
-# ----------- Azure OpenAI Config -----------
-os.environ["AZURE_OPENAI_API_KEY"] = "your-azure-api-key"
-os.environ["AZURE_OPENAI_ENDPOINT"] = "https://your-resource-name.openai.azure.com"
-os.environ["AZURE_OPENAI_DEPLOYMENT_NAME"] = "your-gpt-deployment-name"
-os.environ["AZURE_OPENAI_API_VERSION"] = "2023-07-01-preview"
+# -------------------- Configuration --------------------
 
-# ----------- PostgreSQL Config -----------
-pgHost = "localhost"
-pgUser = "your_user"
-pgPassword = "your_password"
-pgDb = "haystack_db"
-pgPort = 5432
+pgUser = os.environ.get("PG_USER", "postgres")
+pgPassword = os.environ.get("PG_PW", "postgres")
+pgDb = os.environ.get("PG_DB", "haystack_db")
+pgHost = os.environ.get("PG_HOST", "localhost")
+pgPort = os.environ.get("PG_PORT", "5432")
 
-# ----------- Helper Functions -----------
-def pdfToChunks(pdfPath, chunkSize=5):
-    doc = fitz.open(pdfPath)
-    documents = []
-    for i, page in enumerate(doc):
-        text = page.get_text()
-        if not text.strip():
-            continue
-        sentences = sent_tokenize(text)
-        for j in range(0, len(sentences), chunkSize):
-            chunk = " ".join(sentences[j:j+chunkSize])
-            documents.append({
-                "content": chunk,
-                "meta": {
-                    "name": os.path.basename(pdfPath),
-                    "page": i + 1
-                }
-            })
-    return documents
+azureApiKey = os.environ["AZURE_OPENAI_API_KEY"]
+azureEndpoint = os.environ["AZURE_OPENAI_ENDPOINT"]
+azureDeployment = os.environ["AZURE_OPENAI_DEPLOYMENT_NAME"]
+azureApiVersion = os.environ.get("AZURE_OPENAI_API_VERSION", "2023-07-01-preview")
 
-def highlightContextInPdf(pdfPath, context, sourcePage, outputPath):
-    doc = fitz.open(pdfPath)
-    found = False
-    for pageNum in range(len(doc)):
-        if pageNum + 1 != sourcePage:
-            continue
-        page = doc[pageNum]
-        matches = page.search_for(context)
-        for inst in matches:
-            highlight = page.add_highlight_annot(inst)
-            highlight.set_info({"title": "RAG Source", "content": "Used to answer question"})
-            highlight.update()
-            found = True
-    if found:
-        doc.save(outputPath, garbage=4, deflate=True)
-    doc.close()
-    return found
+# -------------------- Haystack Setup --------------------
 
-# ----------- Haystack Setup -----------
 documentStore = SQLDocumentStore(
     url=f"postgresql://{pgUser}:{pgPassword}@{pgHost}:{pgPort}/{pgDb}",
-    index="pdf_documents",
+    index="pdf_docs",
     content_field="content",
-    embedding_field=None,
     recreate_index=True
 )
 
 retriever = BM25Retriever(document_store=documentStore)
 
 reader = OpenAIAnswerGenerator(
-    api_key=os.environ["AZURE_OPENAI_API_KEY"],
-    azure_deployment=os.environ["AZURE_OPENAI_DEPLOYMENT_NAME"],
-    azure_endpoint=os.environ["AZURE_OPENAI_ENDPOINT"],
-    azure_api_version=os.environ["AZURE_OPENAI_API_VERSION"],
-    model="gpt-35-turbo"
+    api_key=azureApiKey,
+    azure_deployment=azureDeployment,
+    azure_endpoint=azureEndpoint,
+    azure_api_version=azureApiVersion,
+    model="gpt-35-turbo",
+    max_tokens=512,
+    return_answer=True,
+    return_context=True,
+    top_k=3
 )
 
-pipeline = GenerativeQAPipeline(generator=reader, retriever=retriever)
+pipeline = GenerativeQAPipeline(retriever=retriever, generator=reader)
 
-# ----------- Main App Logic -----------
-def qaPipeline(pdfFile, question):
-    if not pdfFile or not question.strip():
-        return "No question or PDF provided.", None, None
+# -------------------- Global Session Storage --------------------
 
-    pdfPath = pdfFile.name
-    documents = pdfToChunks(pdfPath)
+sessionData = {
+    "pdfPath": None,
+    "highlightedPath": None,
+    "pdfIndexed": False,
+    "pdfName": None,
+}
 
-    if not documents:
-        return "No text found in PDF.", None, None
+# -------------------- PDF Utilities --------------------
 
+def pdfToChunks(pdfPath, chunkSize=5):
+    documents = []
+    with pdfplumber.open(pdfPath) as pdf:
+        for i, page in enumerate(pdf.pages):
+            text = page.extract_text()
+            if not text or not text.strip():
+                continue
+            sentences = sent_tokenize(text)
+            for j in range(0, len(sentences), chunkSize):
+                chunk = " ".join(sentences[j:j + chunkSize])
+                documents.append({
+                    "content": chunk,
+                    "meta": {"name": os.path.basename(pdfPath), "page": i + 1}
+                })
+    return documents
+
+def highlightContextsInPdf(originalPath, contexts, outputPath):
+    doc = fitz.open(originalPath)
+    foundAny = False
+
+    for answer in contexts:
+        context = answer.context.strip()
+        pageNum = answer.meta.get("page")
+        if not context or not isinstance(pageNum, int):
+            continue
+        page = doc[pageNum - 1]
+        matches = page.search_for(context, hit_max=10)
+        for inst in matches:
+            highlight = page.add_highlight_annot(inst)
+            highlight.set_info({"title": "Answer Context", "content": "Used as context for an answer."})
+            highlight.update()
+            foundAny = True
+
+    if foundAny:
+        doc.save(outputPath, garbage=4, deflate=True)
+    doc.close()
+    return foundAny
+
+# -------------------- Handlers --------------------
+
+def uploadPdf(pdfFile):
+    with NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+        tmp.write(pdfFile.read())
+        sessionData["pdfPath"] = tmp.name
+        sessionData["highlightedPath"] = tmp.name  # Initially unmodified
+        sessionData["pdfName"] = os.path.basename(pdfFile.name)
+
+    # Chunk and index
+    documents = pdfToChunks(sessionData["pdfPath"])
     documentStore.delete_documents()
     documentStore.write_documents(documents)
+    sessionData["pdfIndexed"] = True
 
-    prediction = pipeline.run(query=question, params={"Retriever": {"top_k": 3}})
+    return f"✅ PDF uploaded and indexed: `{sessionData['pdfName']}`"
 
-    if not prediction["answers"]:
-        return "No answer found.", None, None
+def askQuestion(question):
+    if not sessionData["pdfIndexed"]:
+        return "⚠️ Please upload and index a PDF first.", None, None
 
-    answer = prediction["answers"][0]
-    context = answer.meta.get("context", "")
-    sourcePage = answer.meta.get("page", "unknown")
-    sourceDoc = answer.meta.get("name", "unknown")
-    confidence = answer.score if hasattr(answer, "score") else None
-    confidenceStr = f"{confidence * 100:.1f}%" if confidence else "N/A"
+    result = pipeline.run(query=question, params={"Retriever": {"top_k": 5}})
+    answers = result.get("answers", [])
 
-    highlightedPdf = "highlighted_output.pdf"
-    found = highlightContextInPdf(pdfPath, context, sourcePage, highlightedPdf)
+    if not answers:
+        return "No answers found.", None, None
 
-    resultText = f"**Answer:** {answer.answer}\n\n"
-    resultText += f"**Confidence:** {confidenceStr}\n\n"
-    resultText += f"**From:** Page {sourcePage} of `{sourceDoc}`\n\n"
-    resultText += f"**Context:**\n{context}"
+    # Highlight on existing (or previous) PDF version
+    newHighlightedPath = "highlighted_output.pdf"
+    highlightContextsInPdf(sessionData["highlightedPath"], answers, newHighlightedPath)
+    sessionData["highlightedPath"] = newHighlightedPath
 
-    if not found:
-        resultText += "\n\n⚠️ Context not found in PDF to highlight."
+    # Format results
+    resultText = ""
+    for i, ans in enumerate(answers, 1):
+        page = ans.meta.get("page", "unknown")
+        name = ans.meta.get("name", "unknown")
+        score = ans.score or 0.0
+        resultText += f"### 🔹 Answer {i}\n"
+        resultText += f"**Answer:** {ans.answer}\n\n"
+        resultText += f"**Confidence:** {score * 100:.1f}%\n"
+        resultText += f"**Page:** {page} from `{name}`\n"
+        resultText += f"**Context:** {ans.context.strip()}\n\n---\n\n"
 
-    return resultText, highlightedPdf, "Download highlighted PDF"
+    return resultText, sessionData["highlightedPath"], "Download highlighted PDF"
 
-# ----------- Gradio Interface -----------
-demo = gr.Interface(
-    fn=qaPipeline,
-    inputs=[
-        gr.File(label="Upload PDF"),
-        gr.Textbox(label="Ask a question")
-    ],
-    outputs=[
-        gr.Markdown(label="Answer and Source"),
-        gr.File(label="Highlighted PDF"),
-        gr.Label(visible=False)
-    ],
-    title="Azure OpenAI PDF QA with Highlighting",
-    description="Upload a PDF, ask a question, and get an answer with the source highlighted. Powered by Azure OpenAI + PostgreSQL.",
-    allow_flagging="never"
-)
+# -------------------- Gradio UI --------------------
+
+with gr.Blocks(title="PDF Multi-Question QA") as demo:
+    gr.Markdown("## 📄 Ask Multiple Questions about a Single PDF Document")
+
+    with gr.Row():
+        with gr.Column():
+            pdfInput = gr.File(label="Upload PDF", type="binary")
+            uploadBtn = gr.Button("Upload & Index PDF")
+            uploadStatus = gr.Markdown()
+
+        with gr.Column():
+            questionBox = gr.Textbox(label="Ask a Question")
+            askBtn = gr.Button("Ask")
+            answerBox = gr.Markdown()
+            highlightedOutput = gr.File(label="Highlighted PDF", visible=True)
+
+    uploadBtn.click(fn=uploadPdf, inputs=[pdfInput], outputs=[uploadStatus])
+    askBtn.click(fn=askQuestion, inputs=[questionBox], outputs=[answerBox, highlightedOutput, gr.Label(visible=False)])
 
 if __name__ == "__main__":
     demo.launch()
